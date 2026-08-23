@@ -1,0 +1,12 @@
+# Obsidian plugin runtime data
+data.json
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Node, in case a build step is ever added
+node_modules/
+package-lock.json
