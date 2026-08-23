@@ -1,0 +1,9 @@
+{
+  "id": "webview-ua-override",
+  "name": "Web Viewer UA Override",
+  "version": "1.0.0",
+  "minAppVersion": "1.8.0",
+  "description": "Routes Obsidian's web views through a clean Electron session with a real Chrome user agent, so Google and other embedded-browser-hostile sign-ins work.",
+  "author": "Ian Monroe",
+  "isDesktopOnly": true
+}
