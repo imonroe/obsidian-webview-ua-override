@@ -1,12 +1,29 @@
 name: Release
 
+# Releases are cut from main, not from tags. Bump "version" in manifest.json on a
+# feature branch, merge it into main, and this workflow creates the matching tag
+# and the GitHub release with the plugin assets attached.
+#
+# Merging anything that does NOT change manifest.json's version is a no-op, so
+# ordinary merges never produce a release.
 on:
   push:
-    tags:
-      - "*"
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      reupload_assets:
+        description: "Re-attach main.js/manifest.json/versions.json to the existing release for the current manifest version"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+# Two merges landing back to back must not race to create the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -15,28 +32,107 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Verify the tag matches manifest.json
+      - name: Read manifest.json
+        id: manifest
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
-          if [ "$TAG" != "$MANIFEST_VERSION" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match manifest version $MANIFEST_VERSION"
-            exit 1
-          fi
+          VERSION=$(node -p "require('./manifest.json').version")
           MIN_APP=$(node -p "require('./manifest.json').minAppVersion")
-          VERSIONS_ENTRY=$(node -p "require('./versions.json')['$MANIFEST_VERSION'] || ''")
-          if [ "$VERSIONS_ENTRY" != "$MIN_APP" ]; then
-            echo "versions.json is missing or wrong for $MANIFEST_VERSION (expected $MIN_APP, got '$VERSIONS_ENTRY')"
+
+          # Obsidian requires the release tag to equal the manifest version exactly,
+          # with no "v" prefix, so reject a version that would produce a bad tag.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::manifest.json version \"$VERSION\" is not a bare semver string (no \"v\" prefix allowed)."
             exit 1
           fi
 
-      - name: Create the release
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "min_app=$MIN_APP" >> "$GITHUB_OUTPUT"
+          echo "manifest version $VERSION (minAppVersion $MIN_APP)"
+
+      - name: Decide what to do
+        id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+          REUPLOAD: ${{ inputs.reupload_assets }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            if [ "$REUPLOAD" = "true" ]; then
+              ACTION=reupload
+              echo "Release $VERSION exists; re-attaching assets as requested."
+            else
+              ACTION=skip
+              echo "Release $VERSION already exists. Bump manifest.json to cut a new one."
+            fi
+          else
+            ACTION=create
+            echo "No release for $VERSION yet; creating it."
+          fi
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "$VERSION: $ACTION" >> "$GITHUB_STEP_SUMMARY"
+
+      # Obsidian reads versions.json to work out which plugin version a given app
+      # version may install, so the entry has to exist before the tag is cut.
+      - name: Sync versions.json
+        if: steps.plan.outputs.action != 'skip'
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+          MIN_APP: ${{ steps.manifest.outputs.min_app }}
+        run: |
+          CURRENT=$(node -p "require('./versions.json')['$VERSION'] || ''")
+          if [ "$CURRENT" = "$MIN_APP" ]; then
+            echo "versions.json already maps $VERSION -> $MIN_APP"
+            exit 0
+          fi
+
+          node -e '
+            const fs = require("fs");
+            const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
+            versions[process.env.VERSION] = process.env.MIN_APP;
+            fs.writeFileSync("versions.json", JSON.stringify(versions, null, 2) + "\n");
+          '
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git commit -m "Map $VERSION to minAppVersion $MIN_APP in versions.json"
+
+          if ! git push origin HEAD:main; then
+            echo "::error::Could not push the versions.json update to main. Add \"$VERSION\": \"$MIN_APP\" to versions.json by hand and merge again."
+            exit 1
+          fi
+
+      - name: Tag the release commit
+        if: steps.plan.outputs.action == 'create'
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists on the remote; the release will reuse it."
+            exit 0
+          fi
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Create the release
+        if: steps.plan.outputs.action == 'create'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --title "$VERSION" \
             --generate-notes \
-            --draft \
             main.js manifest.json versions.json
+
+      - name: Re-attach assets to the existing release
+        if: steps.plan.outputs.action == 'reupload'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          gh release upload "$VERSION" \
+            main.js manifest.json versions.json --clobber
