@@ -139,6 +139,20 @@ This plugin depends on Obsidian internals that are not part of the public API: `
 
 **This plugin should eventually become unnecessary.** The right fix belongs in Obsidian: send a valid user agent, stop deleting security headers, and expose a supported way for plugins to create webviews with clean sessions. If that ships, disable this and carry on.
 
+## Releasing
+
+Releases are cut from `main` by [the release workflow](.github/workflows/release.yml). Don't create them from the GitHub UI: Obsidian requires the release tag to match `manifest.json` exactly, so the workflow creates the tag itself.
+
+To cut a release, on a feature branch:
+
+1. Bump `version` in `manifest.json`.
+2. Add the matching entry to `versions.json` (`"<version>": "<minAppVersion>"`).
+3. Open a pull request and merge it into `main`.
+
+The workflow then creates the tag, publishes the release, and attaches `main.js`, `manifest.json` and `versions.json` to it. Merging anything that doesn't change the version is a no-op, so ordinary merges never cut a release.
+
+The same checks run on the pull request, so a `v`-prefixed version or a missing `versions.json` entry fails before the merge rather than after it. Step 2 is manual because a ruleset on `main` requires changes to arrive through a pull request, so the workflow can't commit it for you.
+
 ## License
 
 [MIT](LICENSE)

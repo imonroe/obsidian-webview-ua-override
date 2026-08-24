@@ -1,12 +1,19 @@
 name: Release
 
-# Releases are cut from main, not from tags. Bump "version" in manifest.json on a
-# feature branch, merge it into main, and this workflow creates the matching tag
-# and the GitHub release with the plugin assets attached.
+# Releases are cut from main, never from a pushed tag: the workflow reads the
+# version out of manifest.json and creates the tag itself, so the two can't
+# disagree — which is what Obsidian checks for.
 #
-# Merging anything that does NOT change manifest.json's version is a no-op, so
-# ordinary merges never produce a release.
+# Bump "version" in manifest.json on a feature branch, add the matching entry to
+# versions.json, and merge. Merging anything that does NOT change the version is
+# a no-op, so ordinary merges never produce a release.
+#
+# The same checks run on pull requests, so a bad version or a missing
+# versions.json entry fails on the PR rather than after the merge.
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -22,7 +29,7 @@ permissions:
 
 # Two merges landing back to back must not race to create the same tag.
 concurrency:
-  group: release
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
   cancel-in-progress: false
 
 jobs:
@@ -41,10 +48,10 @@ jobs:
           VERSION=$(node -p "require('./manifest.json').version")
           MIN_APP=$(node -p "require('./manifest.json').minAppVersion")
 
-          # Obsidian requires the release tag to equal the manifest version exactly,
-          # with no "v" prefix, so reject a version that would produce a bad tag.
+          # Obsidian requires the release tag to equal the manifest version
+          # exactly, with no "v" prefix, so reject anything that would tag badly.
           if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error::manifest.json version \"$VERSION\" is not a bare semver string (no \"v\" prefix allowed)."
+            echo "::error file=manifest.json::version \"$VERSION\" is not a bare semver string (no \"v\" prefix allowed)."
             exit 1
           fi
 
@@ -52,8 +59,30 @@ jobs:
           echo "min_app=$MIN_APP" >> "$GITHUB_OUTPUT"
           echo "manifest version $VERSION (minAppVersion $MIN_APP)"
 
+      # Obsidian reads versions.json to decide which plugin version a given app
+      # version may install, so the entry has to be committed before the tag is
+      # cut. A ruleset on main means this workflow can't commit it for you, which
+      # is why the check also runs on the pull request.
+      - name: Check versions.json
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+          MIN_APP: ${{ steps.manifest.outputs.min_app }}
+        run: |
+          CURRENT=$(node -p "require('./versions.json')['$VERSION'] || ''")
+          if [ "$CURRENT" = "$MIN_APP" ]; then
+            echo "versions.json maps $VERSION -> $MIN_APP"
+            exit 0
+          fi
+          if [ -z "$CURRENT" ]; then
+            echo "::error file=versions.json::versions.json has no entry for $VERSION. Add \"$VERSION\": \"$MIN_APP\" to versions.json in this pull request."
+          else
+            echo "::error file=versions.json::versions.json maps $VERSION to $CURRENT, but manifest.json says minAppVersion is $MIN_APP. Make them agree."
+          fi
+          exit 1
+
       - name: Decide what to do
         id: plan
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.manifest.outputs.version }}
@@ -74,37 +103,6 @@ jobs:
           echo "action=$ACTION" >> "$GITHUB_OUTPUT"
           echo "$VERSION: $ACTION" >> "$GITHUB_STEP_SUMMARY"
 
-      # Obsidian reads versions.json to work out which plugin version a given app
-      # version may install, so the entry has to exist before the tag is cut.
-      - name: Sync versions.json
-        if: steps.plan.outputs.action != 'skip'
-        env:
-          VERSION: ${{ steps.manifest.outputs.version }}
-          MIN_APP: ${{ steps.manifest.outputs.min_app }}
-        run: |
-          CURRENT=$(node -p "require('./versions.json')['$VERSION'] || ''")
-          if [ "$CURRENT" = "$MIN_APP" ]; then
-            echo "versions.json already maps $VERSION -> $MIN_APP"
-            exit 0
-          fi
-
-          node -e '
-            const fs = require("fs");
-            const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
-            versions[process.env.VERSION] = process.env.MIN_APP;
-            fs.writeFileSync("versions.json", JSON.stringify(versions, null, 2) + "\n");
-          '
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add versions.json
-          git commit -m "Map $VERSION to minAppVersion $MIN_APP in versions.json"
-
-          if ! git push origin HEAD:main; then
-            echo "::error::Could not push the versions.json update to main. Add \"$VERSION\": \"$MIN_APP\" to versions.json by hand and merge again."
-            exit 1
-          fi
-
       - name: Tag the release commit
         if: steps.plan.outputs.action == 'create'
         env:
@@ -114,6 +112,8 @@ jobs:
             echo "Tag $VERSION already exists on the remote; the release will reuse it."
             exit 0
           fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$VERSION" -m "$VERSION"
           git push origin "refs/tags/$VERSION"
 
