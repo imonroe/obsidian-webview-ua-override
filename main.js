@@ -19,6 +19,20 @@
  *   3. Every <webview> element gets an explicit Chrome user agent before it
  *      is attached to the DOM.
  *   4. Every <webview> element denies permission requests.
+ *   5. A main-process handle on the partition's session is held for as long
+ *      as the plugin is loaded, and its storage is flushed to disk.
+ *
+ * On (5): suppressing the IPC in (2) also means nothing in the main process
+ * owns the session any more. Obsidian keeps its own sessions in a module-level
+ * map for the lifetime of the app; ours had no owner at all, because the only
+ * reference it ever got was a local variable holding an @electron/remote proxy
+ * that was released as soon as the function returned. An Electron session with
+ * no live reference in the main process is collectable, and its browser context
+ * goes with it, which is how a partition that is spelled "persist:" still comes
+ * back empty after a restart. Holding the handle keeps the context alive;
+ * flushing on a timer, on window close and on unload means an Obsidian that is
+ * killed rather than quit (an OS restart, say) still leaves the cookie jar and
+ * local storage on disk.
  *
  * On (4), be precise about what is and is not covered. Electron routes media,
  * geolocation, notifications, midiSysex, pointerLock, fullscreen and
@@ -43,6 +57,13 @@ const { Plugin, PluginSettingTab, Setting, Notice } = obsidian;
 
 const LOG = '[webview-ua-override]';
 
+// Electron persists a partition to disk only when its name starts with this.
+const PERSIST_PREFIX = 'persist:';
+
+// Cheap when there is nothing to write, so it can run often enough to survive
+// an ungraceful shutdown without being a nuisance.
+const FLUSH_INTERVAL_MS = 60 * 1000;
+
 const DEFAULT_SETTINGS = {
   partitionSuffix: 'clean',
   userAgent: '',
@@ -59,6 +80,18 @@ function deriveUserAgent(ua) {
     .trim();
 }
 
+/** Derive our partition from Obsidian's, keeping the persist: prefix at the
+ *  front where Electron looks for it. Obsidian's partition already starts with
+ *  it, so for every build this has shipped against the result is unchanged:
+ *  persist:vault-<id> becomes persist:vault-<id>-clean. The normalisation is
+ *  there so that a future Obsidian handing us a bare name cannot silently
+ *  downgrade web views to an in-memory session that forgets every login. */
+function buildPartition(base, suffix) {
+  const raw = String(base || '');
+  const body = raw.indexOf(PERSIST_PREFIX) === 0 ? raw.slice(PERSIST_PREFIX.length) : raw;
+  return PERSIST_PREFIX + body + '-' + suffix;
+}
+
 class WebviewUAOverride extends Plugin {
   constructor(app, manifest) {
     super(app, manifest);
@@ -66,6 +99,7 @@ class WebviewUAOverride extends Plugin {
     // onload throws on its very first await.
     this.restores = [];
     this.patchedWindows = new Map();
+    this.session = null;
     this.active = false;
     this.unloaded = false;
   }
@@ -95,12 +129,18 @@ class WebviewUAOverride extends Plugin {
     }
 
     this.basePartition = this.app.getWebviewPartition();
-    this.partition = this.basePartition + '-' + (this.settings.partitionSuffix || 'clean');
+    this.partition = buildPartition(this.basePartition, this.settings.partitionSuffix || 'clean');
 
     this.patchPartition();
     this.patchIpc();
     this.patchAllOpenWindows();
-    this.applySessionUserAgent();
+    this.acquireSession();
+
+    if (this.session) {
+      // Obsidian clears both of these when the plugin unloads.
+      this.registerInterval(window.setInterval(() => this.flushStorage(), FLUSH_INTERVAL_MS));
+      this.registerDomEvent(window, 'beforeunload', () => this.flushStorage('window closing'));
+    }
 
     // Popout windows are separate JS realms with their own Document.prototype.
     this.registerEvent(
@@ -116,7 +156,8 @@ class WebviewUAOverride extends Plugin {
     console.info(
       LOG, 'active.',
       '\n  partition:', this.partition,
-      '\n  userAgent:', this.effectiveUserAgent()
+      '\n  userAgent:', this.effectiveUserAgent(),
+      '\n  session handle:', this.session ? 'held' : 'MISSING (logins may not survive a restart)'
     );
 
     this.rebuildWebViews();
@@ -126,6 +167,11 @@ class WebviewUAOverride extends Plugin {
     const wasActive = this.active;
     this.active = false;
     this.unloaded = true;
+
+    // Last chance to get anything the open web views wrote onto disk: dropping
+    // the handle below may be what takes the session down.
+    try { this.flushStorage('plugin unload'); } catch (err) { console.error(LOG, err); }
+    this.session = null;
 
     // Unwinding is unconditional. onload installs patches several statements
     // before it sets this.active, so gating the unwind on that flag would
@@ -306,21 +352,61 @@ class WebviewUAOverride extends Plugin {
     }
   }
 
-  /* ---- belt and braces: set the UA on the session object too ---- */
+  /* ---- patch 5: own the session, and keep its storage on disk ---- */
 
-  applySessionUserAgent() {
+  acquireSession() {
     const ua = this.effectiveUserAgent();
-    if (!ua) return;
     try {
       const remote = this.electron.remote || require('@electron/remote');
-      const ses = remote.session.fromPartition(this.partition);
-      ses.setUserAgent(ua);
-      console.debug(LOG, 'session user agent set via @electron/remote');
+      // Stored on the plugin on purpose, not in a local. @electron/remote
+      // releases the main-process object as soon as the renderer drops its
+      // proxy, and an unreferenced session takes its browser context, cookie
+      // jar and local storage down with it. Obsidian keeps its own sessions
+      // alive the same way; this is that, for the partition we made.
+      this.session = remote.session.fromPartition(this.partition);
+      if (ua) this.session.setUserAgent(ua);
+      console.debug(LOG, 'main-process session handle held for', this.partition);
+      return true;
     } catch (err) {
-      // Not fatal. The per-element useragent attribute already covers the
-      // guest page and everything it loads.
-      console.debug(LOG, 'session-level user agent unavailable:', err && err.message);
+      this.session = null;
+      // The per-element useragent attribute still covers the guest page, so
+      // sign-ins keep working. Persistence is what suffers, and silently, so
+      // say so at a level that shows up in the console by default.
+      console.warn(
+        LOG,
+        'no main-process session handle; web view logins may not survive a restart:',
+        err && err.message
+      );
+      return false;
     }
+  }
+
+  /** Ask Chromium to write the partition's cookies and DOM storage out now.
+   *  Both are lazy by design, and neither survives Obsidian being killed
+   *  instead of quit, which is what an operating system restart does. */
+  flushStorage(reason) {
+    const ses = this.session;
+    if (!ses) return;
+
+    try {
+      const cookies = ses.cookies;
+      if (cookies && typeof cookies.flushStore === 'function') {
+        const done = cookies.flushStore();
+        if (done && typeof done.catch === 'function') {
+          done.catch(function (err) { console.debug(LOG, 'cookie flush failed', err); });
+        }
+      }
+    } catch (err) {
+      console.debug(LOG, 'cookie flush failed', err);
+    }
+
+    try {
+      if (typeof ses.flushStorageData === 'function') ses.flushStorageData();
+    } catch (err) {
+      console.debug(LOG, 'DOM storage flush failed', err);
+    }
+
+    if (reason) console.debug(LOG, 'flushed web view storage:', reason);
   }
 
   /* ---- make open tabs pick up the change ---- */
@@ -433,9 +519,36 @@ class WebviewUASettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName('Save web view storage now')
+      .setDesc(
+        'Writes web view cookies and local storage to disk immediately. This also happens once a minute, ' +
+        'when Obsidian closes, and when the plugin unloads, so you should not need it. It is here for when ' +
+        'you are about to restart the machine and want to be sure.'
+      )
+      .addButton((button) =>
+        button
+          .setButtonText('Save now')
+          .onClick(() => {
+            if (!this.plugin.session) {
+              new Notice('Web Viewer UA Override: no session handle, nothing to save. See the console.');
+              return;
+            }
+            this.plugin.flushStorage('manual');
+            new Notice('Web view storage written to disk.');
+          })
+      );
+
     const status = containerEl.createEl('div', { cls: 'setting-item-description' });
     status.createEl('p', { text: 'Active partition: ' + (this.plugin.partition || 'not patched') });
     status.createEl('p', { text: 'Active user agent: ' + this.plugin.effectiveUserAgent() });
+    status.createEl('p', {
+      text:
+        'Session handle: ' +
+        (this.plugin.session
+          ? 'held. Sign-ins in web views survive restarting Obsidian and the computer.'
+          : 'missing. Sign-ins in web views may be lost on restart — check the console for the reason.'),
+    });
     status.createEl('p', {
       text:
         'While this plugin is enabled, Obsidian’s built-in EasyList ad blocking does not apply to web views, ' +
