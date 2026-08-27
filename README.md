@@ -71,25 +71,8 @@ So while this plugin is enabled:
 2. **`ipcRenderer.send` swallows `create-browser-session`** for that partition, so the main process never initialises it and the hooks never land.
 3. **Every `<webview>` gets an explicit user agent.** `Document.prototype.createElement` is wrapped per window realm, so the `useragent` attribute is set the instant the element exists, before Obsidian assigns `partition` and `src` and before it attaches to the DOM. Electron requires that ordering.
 4. **Every `<webview>` denies permission requests**, standing in for the session-level permission sandbox that a fresh partition does not have.
-5. **A main-process handle on the partition's session is held** for as long as the plugin is loaded, and its cookies and local storage are flushed to disk on a timer, when the window closes, and on unload. This is what makes sign-ins survive a restart — see below.
 
 Both Web Viewer tabs and Canvas web embeds call `getWebviewPartition()`, so both are covered.
-
-### Why sign-ins used to vanish on restart
-
-Step 2 has a cost that is not obvious. Obsidian's main process keeps every session it creates in a module-level `sessions` map, so those objects stay referenced for the lifetime of the app. Suppressing the IPC means ours never lands in that map — and before v1.1.0 nothing else referenced it either. The one call that touched it, `session.fromPartition()` over `@electron/remote`, put the result in a local variable that went out of scope immediately, and `@electron/remote` releases the main-process object as soon as the renderer drops its proxy.
-
-That is the one structural difference between our partition and Obsidian's, which persists logins perfectly well. Electron ties a session's browser context — cookie jar, local storage and all — to the lifetime of the `Session` object; with no owner holding it, there is nothing keeping the context around to be written out at shutdown. The partition was spelled `persist:` and still came back empty. Web views behaved like a brand new browser on every launch.
-
-Chromium also writes both cookies and DOM storage lazily, which is a second way to lose them: an operating system restart usually kills Obsidian rather than asking it to quit, and whatever had not been committed yet is gone.
-
-The fix covers both. Hold the handle on the plugin instance instead of in a local, which is exactly what Obsidian does for its own sessions, and flush explicitly:
-
-- every 60 seconds (`session.flushStorageData()` and `session.cookies.flushStore()`, both no-ops when there is nothing pending),
-- on the window's `beforeunload`, which is what fires when Obsidian quits normally,
-- when the plugin unloads, before the handle is dropped.
-
-The timer is what covers the hard kill, where `beforeunload` never runs. Both flush calls are no-ops when there is nothing pending, so running one a minute costs nothing.
 
 ## Install
 
@@ -115,13 +98,12 @@ There is no build step. `main.js` is plain CommonJS, committed as-is, so you can
 | **User agent** | empty | The UA string web views report. Empty means "take Obsidian's own UA and strip the `obsidian/` and `Electron/` tokens", which is exactly what Obsidian does for its own sessions and yields a normal Chrome UA. |
 | **Partition suffix** | `clean` | Appended to Obsidian's partition name. Change it to start a brand new cookie jar, which is the fastest way to sign out of everything at once. |
 | **Deny permission requests** | on | Denies camera, microphone, geolocation, notifications, MIDI, pointer lock, fullscreen and open-external requests from pages in web views. Leave it on. |
-| **Save web view storage now** | — | A button. Flushes cookies and local storage to disk immediately. The plugin already does this every minute and on close, so this is only for when you are about to pull the plug and want to be sure. |
 
 Settings apply to web views opened after you close the settings window. Existing ones keep what they were given.
 
 ## What to expect
 
-**A fresh cookie jar, once.** The clean partition starts empty, so every site wants a new login the first time. After that the logins stick, across Obsidian restarts and machine restarts alike. Disabling the plugin puts you back on the original partition with your old cookies intact, untouched.
+**A fresh cookie jar.** The clean partition starts empty, so every site wants a new login the first time. Disabling the plugin puts you back on the original partition with your old cookies intact, untouched.
 
 **No ad blocking in web views.** Obsidian's EasyList and EasyPrivacy filtering rides on the same handler that breaks Google sign-in. Skipping one skips the other. There is no way to keep just the good half: it is a single IPC handler, all or nothing.
 
@@ -137,12 +119,9 @@ Open the developer console with `Ctrl+Shift+I` (`Cmd+Opt+I` on macOS) and look f
 [webview-ua-override] active.
   partition: persist:vault-xxxxxxxx-clean
   userAgent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...
-  session handle: held
 ```
 
-The settings tab shows the same three values. Then try signing into Google in a Web Viewer tab.
-
-`session handle: MISSING` means `@electron/remote` was unavailable and the partition has no owner in the main process. Sign-ins will still work, but they may not survive a restart. The console carries the underlying reason on the line above.
+The settings tab shows the same two values. Then try signing into Google in a Web Viewer tab.
 
 If you ever see `create-browser-session passed through unrecognised args` in the console, Obsidian changed the IPC call shape and this plugin has stopped protecting the partition. That warning exists so the failure is visible instead of mysterious.
 
