@@ -20,6 +20,29 @@
  *      is attached to the DOM.
  *   4. Every <webview> element denies permission requests.
  *
+ * The partition name deliberately does not begin with "vault-". At startup,
+ * before any window exists, Obsidian's main process sweeps the Partitions
+ * directory like this:
+ *
+ *     for (let name of await readdir(partitionsDir)) {
+ *       let id = name.replace(/^vault-/, "");
+ *       vaults[id] || await removePartition(id);   // rm -rf Partitions/vault-<id>
+ *     }
+ *
+ * Any directory named "vault-" plus something that is not a registered vault
+ * id is removed recursively on every launch. That is a garbage collector for
+ * vaults you have deleted, and persist:vault-<appId>-clean is exactly its
+ * shape, which is why web view logins used to be gone after every restart:
+ * the cookie jar was written out correctly and then deleted before anything
+ * could read it back.
+ *
+ * A name that does not begin with "vault-" survives, because the strip is then
+ * a no-op and the removal targets Partitions/vault-<name>, which does not
+ * exist. The asymmetry between the name read and the path removed is a bug in
+ * Obsidian, but depending on it fails safe: if it is ever fixed, web views go
+ * back to forgetting logins between launches, which is where they already
+ * were. Nothing else in Obsidian reads that directory.
+ *
  * On (4), be precise about what is and is not covered. Electron routes media,
  * geolocation, notifications, midiSysex, pointerLock, fullscreen and
  * openExternal through the element's permissionrequest event, and those are
@@ -43,6 +66,13 @@ const { Plugin, PluginSettingTab, Setting, Notice } = obsidian;
 
 const LOG = '[webview-ua-override]';
 
+// Electron only writes a partition to disk when the name starts with this.
+const PERSIST_PREFIX = 'persist:';
+
+// Anything but "vault-", so Obsidian's startup sweep of the Partitions
+// directory leaves ours alone. See the note at the top of this file.
+const PARTITION_PREFIX = 'wvua-';
+
 const DEFAULT_SETTINGS = {
   partitionSuffix: 'clean',
   userAgent: '',
@@ -57,6 +87,23 @@ function deriveUserAgent(ua) {
     .filter(function (tok) { return tok && !/^(obsidian|electron)/i.test(tok); })
     .join(' ')
     .trim();
+}
+
+/** The vault-scoped part of Obsidian's partition name, with the persist: and
+ *  vault- prefixes taken off. persist:vault-1233ab05823789ae yields
+ *  1233ab05823789ae. */
+function partitionBody(base) {
+  let body = String(base || '');
+  if (body.indexOf(PERSIST_PREFIX) === 0) body = body.slice(PERSIST_PREFIX.length);
+  if (body.indexOf('vault-') === 0) body = body.slice('vault-'.length);
+  return body;
+}
+
+/** Our partition name. persist: has to lead for Electron to keep the session
+ *  on disk at all, and the token after it has to differ from vault- for
+ *  Obsidian to leave the directory there between launches. */
+function buildPartition(base, suffix) {
+  return PERSIST_PREFIX + PARTITION_PREFIX + partitionBody(base) + '-' + suffix;
 }
 
 class WebviewUAOverride extends Plugin {
@@ -95,7 +142,8 @@ class WebviewUAOverride extends Plugin {
     }
 
     this.basePartition = this.app.getWebviewPartition();
-    this.partition = this.basePartition + '-' + (this.settings.partitionSuffix || 'clean');
+    this.vaultToken = partitionBody(this.basePartition);
+    this.partition = buildPartition(this.basePartition, this.settings.partitionSuffix || 'clean');
 
     this.patchPartition();
     this.patchIpc();
@@ -187,7 +235,7 @@ class WebviewUAOverride extends Plugin {
     }
 
     const partition = this.partition;
-    const basePartition = this.basePartition;
+    const vaultToken = this.vaultToken;
     const hadOwn = Object.prototype.hasOwnProperty.call(ipc, 'send');
     const originalSend = ipc.send;
 
@@ -199,9 +247,9 @@ class WebviewUAOverride extends Plugin {
     // Only complain about a miss that looks like it was meant to be ours.
     // Other callers may legitimately create sessions on their own partitions.
     const looksLikeOurs = function (arg) {
-      if (typeof arg === 'string') return arg.indexOf(basePartition) !== -1;
+      if (typeof arg === 'string') return arg.indexOf(vaultToken) !== -1;
       if (arg && typeof arg === 'object' && typeof arg.partition === 'string') {
-        return arg.partition.indexOf(basePartition) !== -1;
+        return arg.partition.indexOf(vaultToken) !== -1;
       }
       return false;
     };
@@ -403,8 +451,8 @@ class WebviewUASettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Partition suffix')
       .setDesc(
-        'Appended to Obsidian’s partition name to make a fresh one. Changing this starts a brand new cookie jar, ' +
-        'which is a quick way to sign out of everything. Restart Obsidian afterwards.'
+        'Appended to the partition name to make a fresh one. Changing this starts a brand new cookie jar, ' +
+        'which is a quick way to sign out of everything in web views. Restart Obsidian afterwards.'
       )
       .addText((text) =>
         text
@@ -439,7 +487,8 @@ class WebviewUASettingTab extends PluginSettingTab {
     status.createEl('p', {
       text:
         'While this plugin is enabled, Obsidian’s built-in EasyList ad blocking does not apply to web views, ' +
-        'and web views use a separate cookie jar from the one they use when the plugin is off.',
+        'and web views use a separate cookie jar from the one they use when the plugin is off. That jar is kept ' +
+        'between launches, so sign-ins survive restarting Obsidian.',
     });
   }
 }
