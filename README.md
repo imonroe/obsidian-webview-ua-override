@@ -117,6 +117,8 @@ install(remote.webContents.fromId(webview.getWebContentsId()));
 
 It has to run on `did-attach`, because the guest has no `WebContents` before that and Obsidian installs its handler as part of attaching. Ours goes in second and wins.
 
+The same main-process code reports each popup back to the renderer console: the URL it was asked for, whether it landed on the same Electron session as the guest, and every navigation, load and failure after that. A popup that opens and then sits there blank is the one failure shape that says nothing about its own cause, and none of that evidence is visible from the plugin's side of the boundary. The session check is the important one, because a popup on a different session is in a different browsing context group, so the opener can neither reach it nor navigate it.
+
 Nothing puts Obsidian's handler back, because `setWindowOpenHandler` has no getter. It does not need putting back: disabling the plugin rebuilds every web view, and the main process installs its handler again on each new guest.
 
 The cost is that *every* `window.open()` in a web view becomes a real window, including ordinary `target="_blank"` links that used to open an Obsidian tab. That is what the **Open popups as real windows** setting turns off.

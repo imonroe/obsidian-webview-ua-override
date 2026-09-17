@@ -75,6 +75,12 @@
  * getter. It does not need putting back: unloading rebuilds every web view, and
  * main installs its handler again on each new guest.
  *
+ * The same main-process code reports each popup back to this renderer: the URL
+ * it was asked for, whether it landed on the same session as the guest, and
+ * every navigation, load and failure afterwards. A popup that opens and then
+ * sits there is the one failure shape that says nothing about its own cause,
+ * and none of that evidence exists on this side of the boundary.
+ *
  * A popup opened that way is a new WebContents, not the guest, so it does not
  * inherit the element's useragent attribute. It takes the session's user agent
  * instead, which is why applySessionUserAgent() matters for sign-in rather than
@@ -116,13 +122,57 @@ const PARTITION_PREFIX = 'wvua-';
 // WebContents as its only argument so that nothing from this realm has to be
 // serialised across, and the handler it installs closes over nothing at all.
 const POPUP_HANDLER_SOURCE = [
-  '(function (webContents) {',
-  '  webContents.setWindowOpenHandler(function () {',
+  '(function (guest, host, channel) {',
+  '  function report(payload) {',
+  '    try {',
+  '      if (!host.isDestroyed()) host.send(channel, payload);',
+  '    } catch (err) {',
+  '      /* the window that asked for this has gone; nothing to report to */',
+  '    }',
+  '  }',
+  '',
+  '  guest.setWindowOpenHandler(function (details) {',
+  '    report({',
+  '      event: "requested",',
+  '      url: details.url,',
+  '      frameName: details.frameName,',
+  '      disposition: details.disposition,',
+  '      features: details.features,',
+  '    });',
   '    return { action: "allow" };',
   '  });',
+  '',
+  '  guest.on("did-create-window", function (win, details) {',
+  '    var popup = win.webContents;',
+  '    report({',
+  '      event: "created",',
+  '      url: details.url,',
+  '      // The decisive one. A popup on a different session is in a different',
+  '      // browsing context group, so the opener cannot reach it and cannot',
+  '      // navigate it, which looks exactly like a window that never loads.',
+  '      sameSession: popup.session === guest.session,',
+  '    });',
+  '    popup.on("will-navigate", function (evt, url) {',
+  '      report({ event: "will-navigate", url: url });',
+  '    });',
+  '    popup.on("did-finish-load", function () {',
+  '      report({ event: "loaded", url: popup.getURL() });',
+  '    });',
+  '    popup.on("did-fail-load", function (evt, code, description, url) {',
+  '      report({ event: "failed", code: code, description: description, url: url });',
+  '    });',
+  '    popup.on("render-process-gone", function (evt, details) {',
+  '      report({ event: "process-gone", reason: details && details.reason });',
+  '    });',
+  '  });',
+  '',
   '  return true;',
   '})',
 ].join('\n');
+
+// Main sends popup diagnostics back over this channel. Popups are rare enough
+// that this can stay on without drowning the console.
+const POPUP_TRACE_CHANNEL = 'wvua-popup-trace';
 
 const DEFAULT_SETTINGS = {
   partitionSuffix: 'clean',
@@ -171,9 +221,11 @@ class WebviewUAOverride extends Plugin {
     this.unloaded = false;
     this.sessionUserAgent = null;
     this.remote = null;
+    this.hostContents = null;
     this.installPopupHandler = null;
     this.popupHandlerError = null;
     this.popupHandlerApplied = false;
+    this.popupTraceListener = null;
   }
 
   async onload() {
@@ -452,14 +504,47 @@ class WebviewUAOverride extends Plugin {
     try {
       const vm = remote.require('vm');
       this.remote = remote;
+      this.hostContents = remote.getCurrentWebContents();
       this.installPopupHandler = vm.runInThisContext(POPUP_HANDLER_SOURCE, {
         filename: 'webview-ua-override-popup-handler.js',
       });
+      this.listenForPopupTrace();
       console.debug(LOG, 'popup handler compiled in the main process');
     } catch (err) {
       this.popupHandlerError = (err && err.message) || String(err);
       console.warn(LOG, 'could not compile the popup handler:', this.popupHandlerError);
     }
+  }
+
+  /** Main reports what happens to each popup it opens. Without this the only
+   *  evidence is a window that sits there, which is the one shape of failure
+   *  that says nothing about its own cause. */
+  listenForPopupTrace() {
+    if (this.popupTraceListener) return;
+
+    const ipc = this.electron.ipcRenderer;
+    if (!ipc || typeof ipc.on !== 'function') {
+      console.warn(LOG, 'ipcRenderer.on is unavailable; popups will not report back.');
+      return;
+    }
+
+    const listener = function (evt, payload) {
+      const bad = payload && (payload.event === 'failed' || payload.event === 'process-gone');
+      (bad ? console.warn : console.info)(LOG, 'popup', (payload && payload.event) || '?', payload);
+    };
+
+    ipc.on(POPUP_TRACE_CHANNEL, listener);
+    this.popupTraceListener = listener;
+
+    const plugin = this;
+    this.restores.push(function () {
+      try {
+        ipc.removeListener(POPUP_TRACE_CHANNEL, listener);
+      } catch (err) {
+        console.error(LOG, 'could not remove the popup trace listener', err);
+      }
+      plugin.popupTraceListener = null;
+    });
   }
 
   replaceWindowOpenHandler(el) {
@@ -482,7 +567,7 @@ class WebviewUAOverride extends Plugin {
       // The handler returns true from the main process. Anything else means
       // the call did not land where it was meant to, which is worth knowing
       // before a sign-in fails for a reason nobody can see.
-      if (this.installPopupHandler(guest) !== true) {
+      if (this.installPopupHandler(guest, this.hostContents, POPUP_TRACE_CHANNEL) !== true) {
         this.popupHandlerError = 'the main process did not confirm the handler';
         console.warn(LOG, this.popupHandlerError, 'for WebContents', id);
         return;
