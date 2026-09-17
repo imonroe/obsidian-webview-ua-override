@@ -19,6 +19,7 @@
  *   3. Every <webview> element gets an explicit Chrome user agent before it
  *      is attached to the DOM.
  *   4. Every <webview> element denies permission requests.
+ *   5. Every <webview> element is allowed to open popup windows.
  *
  * The partition name deliberately does not begin with "vault-". At startup,
  * before any window exists, Obsidian's main process sweeps the Partitions
@@ -42,6 +43,23 @@
  * Obsidian, but depending on it fails safe: if it is ever fixed, web views go
  * back to forgetting logins between launches, which is where they already
  * were. Nothing else in Obsidian reads that directory.
+ *
+ * On (5): Google's sign-in button, and every other identity provider that
+ * uses popup mode, calls window.open() and then waits for the popup to call
+ * window.opener.postMessage() and window.close(). Electron denies window.open()
+ * outright for a guest page whose <webview> has no allowpopups attribute, so
+ * the opener link that the whole handshake rides on is never created. The
+ * sign-in itself completes, the popup lands on its callback page with a null
+ * opener, and it sits there blank while the page that started the flow times
+ * out and reports a login error. Setting allowpopups gives the popup real
+ * window semantics: same session, same cookie jar, live opener.
+ *
+ * A popup opened that way is a new WebContents, not the guest, so it does not
+ * inherit the element's useragent attribute. It takes the session's user agent
+ * instead, which is why applySessionUserAgent() matters for sign-in rather than
+ * being the belt-and-braces it looks like. That call needs @electron/remote; if
+ * it is unavailable, popups report Obsidian's own user agent and Google blocks
+ * them, so the failure is logged loudly instead of at debug level.
  *
  * On (4), be precise about what is and is not covered. Electron routes media,
  * geolocation, notifications, midiSysex, pointerLock, fullscreen and
@@ -77,6 +95,8 @@ const DEFAULT_SETTINGS = {
   partitionSuffix: 'clean',
   userAgent: '',
   denyPermissions: true,
+  allowPopups: true,
+  debugLogging: false,
 };
 
 /** Strip the obsidian/x.y.z and Electron/x.y.z tokens, the same way Obsidian's
@@ -115,6 +135,7 @@ class WebviewUAOverride extends Plugin {
     this.patchedWindows = new Map();
     this.active = false;
     this.unloaded = false;
+    this.sessionUserAgent = null;
   }
 
   async onload() {
@@ -346,6 +367,12 @@ class WebviewUAOverride extends Plugin {
     // Must happen before the element is attached and navigation starts.
     if (ua) el.setAttribute('useragent', ua);
 
+    // Without this, Electron denies window.open() from the guest page and the
+    // opener link that popup-mode sign-ins depend on is never created.
+    if (this.settings.allowPopups) el.setAttribute('allowpopups', '');
+
+    if (this.settings.debugLogging) this.instrumentWebview(el);
+
     if (this.settings.denyPermissions) {
       el.addEventListener('permissionrequest', function (evt) {
         console.warn(LOG, 'denied permission request:', evt.permission, el.getAttribute('src') || '');
@@ -354,20 +381,80 @@ class WebviewUAOverride extends Plugin {
     }
   }
 
-  /* ---- belt and braces: set the UA on the session object too ---- */
+  /* ---- opt-in tracing, for working out where a sign-in falls over ---- */
+
+  instrumentWebview(el) {
+    const describe = function () {
+      try {
+        return el.getURL() || el.getAttribute('src') || '(no url yet)';
+      } catch (err) {
+        return el.getAttribute('src') || '(no url yet)';
+      }
+    };
+
+    // A web view element appearing at the moment you click "sign in with
+    // Google" means Obsidian caught the window.open() and turned it into
+    // another web view, which has no opener and cannot finish the handshake.
+    console.debug(LOG, 'webview element created at', new Date().toISOString());
+
+    el.addEventListener('did-attach', function () {
+      console.debug(LOG, 'webview attached:', describe(), 'partition:', el.getAttribute('partition'));
+    });
+    el.addEventListener('did-navigate', function (evt) {
+      console.debug(LOG, 'webview navigated:', evt.url);
+    });
+    el.addEventListener('did-navigate-in-page', function (evt) {
+      console.debug(LOG, 'webview navigated in page:', evt.url);
+    });
+    el.addEventListener('did-fail-load', function (evt) {
+      // -3 is ERR_ABORTED, which every cancelled or redirected load reports.
+      if (evt.errorCode === -3) return;
+      console.warn(LOG, 'webview load failed:', evt.errorCode, evt.errorDescription, evt.validatedURL);
+    });
+    el.addEventListener('console-message', function (evt) {
+      console.debug(LOG, 'guest console:', evt.message);
+    });
+  }
+
+  /* ---- the session user agent, which is what popup windows report ---- */
+
+  loadRemote() {
+    try {
+      return require('@electron/remote');
+    } catch (err) {
+      /* fall through to the legacy location */
+    }
+    try {
+      if (this.electron && this.electron.remote) return this.electron.remote;
+    } catch (err) {
+      /* nothing left to try */
+    }
+    return null;
+  }
 
   applySessionUserAgent() {
+    this.sessionUserAgent = null;
+
     const ua = this.effectiveUserAgent();
     if (!ua) return;
+
+    const remote = this.loadRemote();
+    if (!remote) {
+      console.warn(
+        LOG,
+        '@electron/remote is unavailable, so the session user agent could not be set.',
+        'Pages inside web views are still covered by the element attribute, but popup',
+        'windows they open will report Obsidian\u2019s own user agent and Google will refuse them.'
+      );
+      return;
+    }
+
     try {
-      const remote = this.electron.remote || require('@electron/remote');
-      const ses = remote.session.fromPartition(this.partition);
-      ses.setUserAgent(ua);
-      console.debug(LOG, 'session user agent set via @electron/remote');
+      remote.session.fromPartition(this.partition).setUserAgent(ua);
+      this.sessionUserAgent = ua;
+      console.debug(LOG, 'session user agent set on', this.partition);
     } catch (err) {
-      // Not fatal. The per-element useragent attribute already covers the
-      // guest page and everything it loads.
-      console.debug(LOG, 'session-level user agent unavailable:', err && err.message);
+      console.warn(LOG, 'could not set the session user agent:', err && err.message);
     }
   }
 
@@ -465,6 +552,23 @@ class WebviewUASettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Allow popup windows')
+      .setDesc(
+        'Lets pages in web views open real popup windows. Sign-in buttons that use a popup, Google\u2019s among them, ' +
+        'hand the result back through the window that opened them, so without this the sign-in finishes and then ' +
+        'fails with the popup left blank. The cost is that any page in a web view can open a window on its own, ' +
+        'and ad blocking is off here. Turn it off if that bothers you more than broken sign-ins.'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.allowPopups)
+          .onChange(async (value) => {
+            this.plugin.settings.allowPopups = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName('Deny permission requests')
       .setDesc(
         'Denies camera, microphone, geolocation, notifications, MIDI, pointer lock, fullscreen and open-external ' +
@@ -481,9 +585,32 @@ class WebviewUASettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName('Debug logging')
+      .setDesc(
+        'Traces every web view to the developer console: when the element is created, where it navigates, ' +
+        'what fails to load, and what the page logs. Use it to work out where a sign-in falls over, then turn it off.'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.debugLogging)
+          .onChange(async (value) => {
+            this.plugin.settings.debugLogging = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     const status = containerEl.createEl('div', { cls: 'setting-item-description' });
     status.createEl('p', { text: 'Active partition: ' + (this.plugin.partition || 'not patched') });
     status.createEl('p', { text: 'Active user agent: ' + this.plugin.effectiveUserAgent() });
+    status.createEl('p', {
+      text:
+        'Popup window user agent: ' +
+        (this.plugin.sessionUserAgent
+          ? this.plugin.sessionUserAgent
+          : 'not set, so popup windows report Obsidian\u2019s own user agent and Google will refuse them. ' +
+            'See the console for why.'),
+    });
     status.createEl('p', {
       text:
         'While this plugin is enabled, Obsidian’s built-in EasyList ad blocking does not apply to web views, ' +

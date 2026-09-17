@@ -71,8 +71,26 @@ So while this plugin is enabled:
 2. **`ipcRenderer.send` swallows `create-browser-session`** for that partition, so the main process never initialises it and the hooks never land.
 3. **Every `<webview>` gets an explicit user agent.** `Document.prototype.createElement` is wrapped per window realm, so the `useragent` attribute is set the instant the element exists, before Obsidian assigns `partition` and `src` and before it attaches to the DOM. Electron requires that ordering.
 4. **Every `<webview>` denies permission requests**, standing in for the session-level permission sandbox that a fresh partition does not have.
+5. **Every `<webview>` is allowed to open popup windows**, which is what popup-mode sign-ins need. See [below](#the-other-half-popup-sign-ins).
 
 Both Web Viewer tabs and Canvas web embeds call `getWebviewPartition()`, so both are covered.
+
+## The other half: popup sign-ins
+
+Fixing the header rewrite gets you signed into Google. It does not get you signed into everything that *uses* Google, and the two failures look nothing alike.
+
+"Continue with Google" on a site like claude.ai does not navigate anywhere. It calls `window.open()`, sends you through Google in the popup, and waits. The popup's last page is a few lines of script:
+
+```js
+window.opener.postMessage(credential, origin);
+window.close();
+```
+
+Both of those need a live `window.opener`. Electron refuses `window.open()` from a guest page whose `<webview>` carries no `allowpopups` attribute, and Obsidian does not set one. So the sign-in itself works, you pick your account, Google redirects to the callback, and the callback has nothing to talk to. The popup sits blank. The page that started the flow waits for a message that never arrives and reports a login error. Nothing in either window says what went wrong, because from each one's point of view nothing did.
+
+Setting `allowpopups` gives the popup real window semantics: same session, same cookie jar, and an opener the callback can reach.
+
+That introduces a second problem, which is why the session user agent matters here. A popup is a new `WebContents`, not the guest, so it does not inherit the element's `useragent` attribute. It takes the **session's** user agent instead, and on a partition Obsidian never initialised that is Obsidian's own UA, `obsidian/1.13.7 Electron/43.3.0` and all. Google blocks it. So the plugin also calls `session.setUserAgent()` on the clean partition through `@electron/remote`, which every later popup inherits. If `@electron/remote` cannot be loaded, that is now a console warning and a line in the settings tab rather than a silent `console.debug`, because on the popup path it is the difference between working and not.
 
 ## Why the partition is not called `vault-something`
 
@@ -133,7 +151,9 @@ There is no build step. `main.js` is plain CommonJS, committed as-is, so you can
 | --- | --- | --- |
 | **User agent** | empty | The UA string web views report. Empty means "take Obsidian's own UA and strip the `obsidian/` and `Electron/` tokens", which is exactly what Obsidian does for its own sessions and yields a normal Chrome UA. |
 | **Partition suffix** | `clean` | Appended to the partition name. Change it to start a brand new cookie jar, which is the fastest way to sign out of everything at once. |
+| **Allow popup windows** | on | Lets pages open real popup windows, with a working `window.opener`. Required for popup-mode sign-ins. The cost is that any page in a web view can open a window unprompted, and ad blocking is off here. |
 | **Deny permission requests** | on | Denies camera, microphone, geolocation, notifications, MIDI, pointer lock, fullscreen and open-external requests from pages in web views. Leave it on. |
+| **Debug logging** | off | Traces every web view to the console: creation, navigation, load failures, and the page's own console output. Turn it on to find out where a sign-in falls over, then turn it off. |
 
 Settings apply to web views opened after you close the settings window. Existing ones keep what they were given.
 
@@ -157,7 +177,11 @@ Open the developer console with `Ctrl+Shift+I` (`Cmd+Opt+I` on macOS) and look f
   userAgent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...
 ```
 
-The settings tab shows the same two values. Then try signing into Google in a Web Viewer tab.
+The settings tab shows the same two values, plus the user agent popup windows will report. If that third line says the session user agent is not set, `@electron/remote` is missing and popup sign-ins will fail even though signing into Google directly works.
+
+Then try signing into Google in a Web Viewer tab.
+
+If a popup sign-in still fails, turn on **Debug logging** and watch the console while you click the sign-in button. A `webview element created` line appearing at that moment means Obsidian intercepted the `window.open()` and turned the popup into another web view, which has no opener and cannot complete the handshake. No such line means Electron made a real popup window and the problem is somewhere else.
 
 If you ever see `create-browser-session passed through unrecognised args` in the console, Obsidian changed the IPC call shape and this plugin has stopped protecting the partition. That warning exists so the failure is visible instead of mysterious.
 
