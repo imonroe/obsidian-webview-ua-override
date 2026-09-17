@@ -19,6 +19,9 @@
  *   3. Every <webview> element gets an explicit Chrome user agent before it
  *      is attached to the DOM.
  *   4. Every <webview> element denies permission requests.
+ *   5. Every <webview> element is allowed to open popup windows, and Obsidian's
+ *      own handler for window.open() is displaced so those popups are real
+ *      windows rather than another web view.
  *
  * The partition name deliberately does not begin with "vault-". At startup,
  * before any window exists, Obsidian's main process sweeps the Partitions
@@ -42,6 +45,57 @@
  * Obsidian, but depending on it fails safe: if it is ever fixed, web views go
  * back to forgetting logins between launches, which is where they already
  * were. Nothing else in Obsidian reads that directory.
+ *
+ * On (5): a popup-mode sign-in, Google's among them, calls window.open() and
+ * then waits for the popup to call window.opener.postMessage() and
+ * window.close(). Three separate things in Obsidian stop that, and all three
+ * have to go.
+ *
+ * First, Electron denies window.open() outright for a guest page whose
+ * <webview> carries no allowpopups attribute, so the opener link the handshake
+ * rides on is never created. The element gets the attribute.
+ *
+ * Second, Obsidian installs its own setWindowOpenHandler on each guest in the
+ * main process, and a handler overrides the attribute outright. Obsidian's
+ * opens the address in another web view, a separate top-level browsing context
+ * with no opener, so the popup arrives wearing Obsidian's chrome and the
+ * handshake is just as dead. Ours replaces it and allows the window, which
+ * gives a real popup on the guest's own session with a live opener.
+ *
+ * A handler must return its verdict to the main process synchronously, so it
+ * cannot be a renderer function passed over @electron/remote: remote invokes
+ * renderer callbacks asynchronously and the verdict arrives long after Electron
+ * has given up. The handler is compiled in the main process with
+ * vm.runInThisContext instead, and the only things crossing the boundary are
+ * the guest's WebContents and this window's, both already main-process objects
+ * passed back by reference. The handler body closes over nothing in this realm.
+ *
+ * Third, Obsidian keeps its own windows from navigating away from the app, and
+ * attaches those guards when a WebContents is created, before anything here can
+ * reach the popup. A guarded popup opens, announces its navigation and then
+ * neither completes nor fails it. The popup is not an Obsidian window, so the
+ * guards come off it, and off nothing else: the main window and the web views
+ * keep theirs. Both navigations need this, not just the first. The auth URL
+ * carries response_mode=form_post, so the callback arrives as a form POST,
+ * renderer-initiated, into the same guard.
+ *
+ * Nothing puts Obsidian's window-open handler back, because setWindowOpenHandler
+ * has no getter. It does not need putting back: unloading rebuilds every web
+ * view, and main installs its own again on each new guest.
+ *
+ * The same main-process code reports each popup back to this renderer: the URL
+ * it was asked for, whether it landed on the same session as the guest, how
+ * many guards it found, and every navigation, load and failure afterwards. A
+ * popup that opens and then sits there is the one failure shape that says
+ * nothing about its own cause, and none of that evidence exists on this side of
+ * the boundary. Failures always print. The rest is behind the debug setting.
+ *
+ * A popup opened that way is a new WebContents, not the guest, so it does not
+ * inherit the element's useragent attribute. It takes the session's user agent
+ * instead, which is why applySessionUserAgent() matters for sign-in rather than
+ * being the belt-and-braces it looks like. That call needs @electron/remote; if
+ * it is unavailable, popups report Obsidian's own user agent and Google blocks
+ * them, so the failure is logged loudly instead of at debug level.
  *
  * On (4), be precise about what is and is not covered. Electron routes media,
  * geolocation, notifications, midiSysex, pointerLock, fullscreen and
@@ -73,10 +127,116 @@ const PERSIST_PREFIX = 'persist:';
 // directory leaves ours alone. See the note at the top of this file.
 const PARTITION_PREFIX = 'wvua-';
 
+// Compiled in the main process, never in this one. Its arguments are the
+// guest's WebContents, this window's, and a channel name: two main-process
+// objects and a string, so nothing from this realm has to be serialised across
+// and the handlers it installs close over nothing at all.
+const POPUP_HANDLER_SOURCE = [
+  '(function (guest, host, channel) {',
+  '  function report(payload) {',
+  '    try {',
+  '      if (!host.isDestroyed()) host.send(channel, payload);',
+  '    } catch (err) {',
+  '      /* the window that asked for this has gone; nothing to report to */',
+  '    }',
+  '  }',
+  '',
+  '  var NAVIGATION_EVENTS = ["will-navigate", "will-frame-navigate", "will-redirect"];',
+  '',
+  '  guest.setWindowOpenHandler(function (details) {',
+  '    report({',
+  '      event: "requested",',
+  '      url: details.url,',
+  '      frameName: details.frameName,',
+  '      disposition: details.disposition,',
+  '      features: details.features,',
+  '    });',
+  '    return { action: "allow" };',
+  '  });',
+  '',
+  '  guest.on("did-create-window", function (win, details) {',
+  '    var popup = win.webContents;',
+  '',
+  '    // Obsidian keeps its windows from navigating away from the app, and it',
+  '    // attaches those guards when the WebContents is created, which is before',
+  '    // this fires. This popup is not an Obsidian window and has to be allowed',
+  '    // to go where it was opened to go, so the guards come off it. Only this',
+  '    // popup is touched: the main window and the web views keep theirs.',
+  '    var guards = 0;',
+  '    for (var i = 0; i < NAVIGATION_EVENTS.length; i++) {',
+  '      guards += popup.listenerCount(NAVIGATION_EVENTS[i]);',
+  '    }',
+  '',
+  '    report({',
+  '      event: "created",',
+  '      url: details.url,',
+  '      // A popup on a different session is in a different browsing context',
+  '      // group, so the opener can neither reach it nor navigate it.',
+  '      sameSession: popup.session === guest.session,',
+  '      navigationGuards: guards,',
+  '    });',
+  '',
+  '    if (guards) {',
+  '      for (var j = 0; j < NAVIGATION_EVENTS.length; j++) {',
+  '        popup.removeAllListeners(NAVIGATION_EVENTS[j]);',
+  '      }',
+  '      report({ event: "guards-removed", count: guards });',
+  '    }',
+  '',
+  '    // Attached after the strip, or they would be stripped too.',
+  '    popup.on("will-navigate", function (evt, url) {',
+  '      report({ event: "will-navigate", url: url, prevented: evt.defaultPrevented });',
+  '    });',
+  '    popup.on("did-finish-load", function () {',
+  '      report({ event: "loaded", url: popup.getURL() });',
+  '    });',
+  '    popup.on("did-fail-load", function (evt, code, description, url, isMainFrame) {',
+  '      // -3 is ERR_ABORTED, which every cancelled or redirected load reports,',
+  '      // and a sign-in flow is mostly redirects. A subframe that fails is not',
+  '      // the popup failing either. Both would warn on a working sign-in.',
+  '      if (code === -3 || isMainFrame === false) return;',
+  '      report({ event: "failed", code: code, description: description, url: url });',
+  '    });',
+  '    popup.on("render-process-gone", function (evt, gone) {',
+  '      report({ event: "process-gone", reason: gone && gone.reason });',
+  '    });',
+  '',
+  '    // Belt for a cancellation that did not come from a listener we can see.',
+  '    // loadURL does not emit will-navigate, so it goes around any guard that',
+  '    // survived the strip. Three things hold it back from a popup that is',
+  '    // behaving: one opened deliberately empty for its opener to navigate,',
+  '    // one that has already committed an address, and one still fetching.',
+  '    if (/^https?:/i.test(details.url)) {',
+  '      setTimeout(function () {',
+  '        try {',
+  '          if (popup.isDestroyed()) return;',
+  '          var current = popup.getURL();',
+  '          if (current && current !== "about:blank") return;',
+  '          if (popup.isLoading()) return;',
+  '          report({ event: "stalled", url: details.url });',
+  '          popup.loadURL(details.url);',
+  '        } catch (err) {',
+  '          report({ event: "reload-failed", message: err && err.message });',
+  '        }',
+  '      }, 2000);',
+  '    }',
+  '  });',
+  '',
+  '  return true;',
+  '})',
+].join('\n');
+
+// Main reports every popup over this channel whatever the settings say, because
+// popups are rare and the cost is nothing. What reaches the console is decided
+// on this side: failures always, the rest only with debug logging on.
+const POPUP_TRACE_CHANNEL = 'wvua-popup-trace';
+
 const DEFAULT_SETTINGS = {
   partitionSuffix: 'clean',
   userAgent: '',
   denyPermissions: true,
+  popupWindows: true,
+  debugLogging: false,
 };
 
 /** Strip the obsidian/x.y.z and Electron/x.y.z tokens, the same way Obsidian's
@@ -115,6 +275,13 @@ class WebviewUAOverride extends Plugin {
     this.patchedWindows = new Map();
     this.active = false;
     this.unloaded = false;
+    this.sessionUserAgent = null;
+    this.remote = null;
+    this.hostContents = null;
+    this.installPopupHandler = null;
+    this.popupHandlerError = null;
+    this.popupHandlerApplied = false;
+    this.popupTraceListener = null;
   }
 
   async onload() {
@@ -149,6 +316,7 @@ class WebviewUAOverride extends Plugin {
     this.patchIpc();
     this.patchAllOpenWindows();
     this.applySessionUserAgent();
+    this.compilePopupHandler();
 
     // Popout windows are separate JS realms with their own Document.prototype.
     this.registerEvent(
@@ -346,6 +514,24 @@ class WebviewUAOverride extends Plugin {
     // Must happen before the element is attached and navigation starts.
     if (ua) el.setAttribute('useragent', ua);
 
+    if (this.settings.popupWindows) {
+      // Electron's own precondition for a guest opening a window at all. It is
+      // overridden by any window-open handler, Obsidian's included, so on its
+      // own it changes nothing; it is the floor the handler below stands on.
+      el.setAttribute('allowpopups', '');
+
+      // The guest has no WebContents until it attaches, and Obsidian installs
+      // its handler as part of attaching, so this waits and then replaces it.
+      if (this.installPopupHandler) {
+        const plugin = this;
+        el.addEventListener('did-attach', function () {
+          plugin.replaceWindowOpenHandler(el);
+        }, { once: true });
+      }
+    }
+
+    if (this.settings.debugLogging) this.instrumentWebview(el);
+
     if (this.settings.denyPermissions) {
       el.addEventListener('permissionrequest', function (evt) {
         console.warn(LOG, 'denied permission request:', evt.permission, el.getAttribute('src') || '');
@@ -354,20 +540,188 @@ class WebviewUAOverride extends Plugin {
     }
   }
 
-  /* ---- belt and braces: set the UA on the session object too ---- */
+  /* ---- patch 5, main-process half: window.open() gives a real window ---- */
+
+  compilePopupHandler() {
+    this.installPopupHandler = null;
+    this.popupHandlerError = null;
+    this.popupHandlerApplied = false;
+
+    if (!this.settings.popupWindows) return;
+
+    const remote = this.loadRemote();
+    if (!remote) {
+      this.popupHandlerError = '@electron/remote is unavailable';
+      console.warn(
+        LOG,
+        'cannot take window.open() back from Obsidian:', this.popupHandlerError + '.',
+        'Popup sign-ins will keep opening in a web view with no opener and keep failing.'
+      );
+      return;
+    }
+
+    try {
+      const vm = remote.require('vm');
+      this.remote = remote;
+      this.hostContents = remote.getCurrentWebContents();
+      this.installPopupHandler = vm.runInThisContext(POPUP_HANDLER_SOURCE, {
+        filename: 'webview-ua-override-popup-handler.js',
+      });
+      this.listenForPopupTrace();
+      console.debug(LOG, 'popup handler compiled in the main process');
+    } catch (err) {
+      this.popupHandlerError = (err && err.message) || String(err);
+      console.warn(LOG, 'could not compile the popup handler:', this.popupHandlerError);
+    }
+  }
+
+  /** Main reports what happens to each popup it opens. Without this the only
+   *  evidence is a window that sits there, which is the one shape of failure
+   *  that says nothing about its own cause. */
+  listenForPopupTrace() {
+    if (this.popupTraceListener) return;
+
+    const ipc = this.electron.ipcRenderer;
+    if (!ipc || typeof ipc.on !== 'function') {
+      console.warn(LOG, 'ipcRenderer.on is unavailable; popups will not report back.');
+      return;
+    }
+
+    // A popup that fails is worth saying so about whether or not anyone asked
+    // for tracing, because the window itself will not say anything. The rest is
+    // routine and stays behind the debug setting, read at call time so the
+    // toggle takes effect without a restart.
+    const plugin = this;
+    const NOTEWORTHY = ['failed', 'process-gone', 'stalled', 'reload-failed'];
+
+    const listener = function (evt, payload) {
+      const event = (payload && payload.event) || 'unknown';
+      if (NOTEWORTHY.indexOf(event) !== -1) {
+        console.warn(LOG, 'popup', event, payload);
+      } else if (plugin.settings.debugLogging) {
+        console.debug(LOG, 'popup', event, payload);
+      }
+    };
+
+    ipc.on(POPUP_TRACE_CHANNEL, listener);
+    this.popupTraceListener = listener;
+
+    this.restores.push(function () {
+      try {
+        ipc.removeListener(POPUP_TRACE_CHANNEL, listener);
+      } catch (err) {
+        console.error(LOG, 'could not remove the popup trace listener', err);
+      }
+      plugin.popupTraceListener = null;
+    });
+  }
+
+  replaceWindowOpenHandler(el) {
+    if (!this.installPopupHandler || !this.remote) return;
+
+    let id;
+    try {
+      id = el.getWebContentsId();
+    } catch (err) {
+      console.warn(LOG, 'web view has no WebContents id at did-attach:', err && err.message);
+      return;
+    }
+
+    try {
+      const guest = this.remote.webContents.fromId(id);
+      if (!guest) {
+        console.warn(LOG, 'no WebContents for id', id);
+        return;
+      }
+      // The handler returns true from the main process. Anything else means
+      // the call did not land where it was meant to, which is worth knowing
+      // before a sign-in fails for a reason nobody can see.
+      if (this.installPopupHandler(guest, this.hostContents, POPUP_TRACE_CHANNEL) !== true) {
+        this.popupHandlerError = 'the main process did not confirm the handler';
+        console.warn(LOG, this.popupHandlerError, 'for WebContents', id);
+        return;
+      }
+      this.popupHandlerApplied = true;
+      console.debug(LOG, 'window.open() handler replaced on WebContents', id);
+    } catch (err) {
+      console.warn(LOG, 'could not replace the window.open() handler:', err && err.message);
+    }
+  }
+
+  /* ---- opt-in tracing, for working out where a sign-in falls over ---- */
+
+  instrumentWebview(el) {
+    const describe = function () {
+      try {
+        return el.getURL() || el.getAttribute('src') || '(no url yet)';
+      } catch (err) {
+        return el.getAttribute('src') || '(no url yet)';
+      }
+    };
+
+    // A web view element appearing at the moment you click "sign in with
+    // Google" means Obsidian caught the window.open() and turned it into
+    // another web view, which has no opener and cannot finish the handshake.
+    console.debug(LOG, 'webview element created at', new Date().toISOString());
+
+    el.addEventListener('did-attach', function () {
+      console.debug(LOG, 'webview attached:', describe(), 'partition:', el.getAttribute('partition'));
+    });
+    el.addEventListener('did-navigate', function (evt) {
+      console.debug(LOG, 'webview navigated:', evt.url);
+    });
+    el.addEventListener('did-navigate-in-page', function (evt) {
+      console.debug(LOG, 'webview navigated in page:', evt.url);
+    });
+    el.addEventListener('did-fail-load', function (evt) {
+      // -3 is ERR_ABORTED, which every cancelled or redirected load reports.
+      if (evt.errorCode === -3) return;
+      console.warn(LOG, 'webview load failed:', evt.errorCode, evt.errorDescription, evt.validatedURL);
+    });
+    el.addEventListener('console-message', function (evt) {
+      console.debug(LOG, 'guest console:', evt.message);
+    });
+  }
+
+  /* ---- the session user agent, which is what popup windows report ---- */
+
+  loadRemote() {
+    try {
+      return require('@electron/remote');
+    } catch (err) {
+      /* fall through to the legacy location */
+    }
+    try {
+      if (this.electron && this.electron.remote) return this.electron.remote;
+    } catch (err) {
+      /* nothing left to try */
+    }
+    return null;
+  }
 
   applySessionUserAgent() {
+    this.sessionUserAgent = null;
+
     const ua = this.effectiveUserAgent();
     if (!ua) return;
+
+    const remote = this.loadRemote();
+    if (!remote) {
+      console.warn(
+        LOG,
+        '@electron/remote is unavailable, so the session user agent could not be set.',
+        'Pages inside web views are still covered by the element attribute, but popup',
+        'windows they open will report Obsidian\u2019s own user agent and Google will refuse them.'
+      );
+      return;
+    }
+
     try {
-      const remote = this.electron.remote || require('@electron/remote');
-      const ses = remote.session.fromPartition(this.partition);
-      ses.setUserAgent(ua);
-      console.debug(LOG, 'session user agent set via @electron/remote');
+      remote.session.fromPartition(this.partition).setUserAgent(ua);
+      this.sessionUserAgent = ua;
+      console.debug(LOG, 'session user agent set on', this.partition);
     } catch (err) {
-      // Not fatal. The per-element useragent attribute already covers the
-      // guest page and everything it loads.
-      console.debug(LOG, 'session-level user agent unavailable:', err && err.message);
+      console.warn(LOG, 'could not set the session user agent:', err && err.message);
     }
   }
 
@@ -465,6 +819,27 @@ class WebviewUASettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Open popups as real windows')
+      .setDesc(
+        'Sign-in buttons that use a popup, Google\u2019s among them, hand the result back through the window that ' +
+        'opened them. Obsidian opens those in another web view, which has no link back, so the sign-in finishes and ' +
+        'then fails with the popup left blank. This gives them a real window instead. Turning it off sends popups, ' +
+        'and every link that opens a new window, back to an Obsidian tab.'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.popupWindows)
+          .onChange(async (value) => {
+            this.plugin.settings.popupWindows = value;
+            await this.plugin.saveSettings();
+            // Compile or discard the main-process handler now, so the status
+            // below is right and the next web view picks the change up.
+            this.plugin.compilePopupHandler();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl)
       .setName('Deny permission requests')
       .setDesc(
         'Denies camera, microphone, geolocation, notifications, MIDI, pointer lock, fullscreen and open-external ' +
@@ -481,9 +856,47 @@ class WebviewUASettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName('Debug logging')
+      .setDesc(
+        'Traces every web view to the developer console: when the element is created, where it navigates, ' +
+        'what fails to load, and what the page logs. It also traces every step a popup takes. A popup that fails ' +
+        'is logged either way; this adds the steps that went right. Use it to work out where a sign-in falls over, ' +
+        'then turn it off.'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.debugLogging)
+          .onChange(async (value) => {
+            this.plugin.settings.debugLogging = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     const status = containerEl.createEl('div', { cls: 'setting-item-description' });
     status.createEl('p', { text: 'Active partition: ' + (this.plugin.partition || 'not patched') });
     status.createEl('p', { text: 'Active user agent: ' + this.plugin.effectiveUserAgent() });
+    status.createEl('p', {
+      text:
+        'Popup window user agent: ' +
+        (this.plugin.sessionUserAgent
+          ? this.plugin.sessionUserAgent
+          : 'not set, so popup windows report Obsidian\u2019s own user agent and Google will refuse them. ' +
+            'See the console for why.'),
+    });
+    status.createEl('p', {
+      text:
+        'Popup windows: ' +
+        (!this.plugin.settings.popupWindows
+          ? 'left to Obsidian, which opens them as web views. Popup sign-ins will not complete.'
+          : this.plugin.popupHandlerApplied
+            ? 'opened as real windows.'
+            : this.plugin.installPopupHandler
+              ? 'ready, and applied to each web view as it opens. Open one to confirm.'
+              : 'could not be taken over from Obsidian (' +
+                (this.plugin.popupHandlerError || 'unknown reason') +
+                '), so popup sign-ins will not complete.'),
+    });
     status.createEl('p', {
       text:
         'While this plugin is enabled, Obsidian’s built-in EasyList ad blocking does not apply to web views, ' +
