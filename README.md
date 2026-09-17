@@ -86,52 +86,55 @@ window.opener.postMessage(credential, origin);
 window.close();
 ```
 
-Both of those need a live `window.opener`. Electron refuses `window.open()` from a guest page whose `<webview>` carries no `allowpopups` attribute, and Obsidian does not set one. So the sign-in itself works, you pick your account, Google redirects to the callback, and the callback has nothing to talk to. The popup sits blank. The page that started the flow waits for a message that never arrives and reports a login error. Nothing in either window says what went wrong, because from each one's point of view nothing did.
+Both lines need a live `window.opener`, and everything below exists to make sure the popup has one. Three separate things in Obsidian take it away, and all three have to go. Fix two and the symptom does not budge.
 
-Setting `allowpopups` gives the popup real window semantics: same session, same cookie jar, and an opener the callback can reach.
+### 1. Electron will not open the window
 
-### The attribute is not enough
+Electron refuses `window.open()` from a guest page whose `<webview>` carries no `allowpopups` attribute, and Obsidian sets none. Every web view gets one.
 
-Obsidian installs its own `setWindowOpenHandler` on each guest in the main process, and a handler overrides the attribute outright. That handler opens the address in another web view, which is a separate top-level browsing context with no opener, so the popup arrives wearing Obsidian's chrome and the handshake is exactly as dead as it was before. The giveaway is visual: if the sign-in popup has an Obsidian title bar, Obsidian caught the `window.open()` and the attribute never got a say.
+On its own this changes nothing, because any window-open handler overrides the attribute and there is always one. It is the floor the next part stands on.
 
-So the handler has to be replaced. That is harder than it sounds, because `setWindowOpenHandler` returns its verdict to the main process **synchronously**, and `@electron/remote` invokes renderer callbacks asynchronously. Hand it a function from here and the return value arrives long after Electron has given up and denied the window. The plugin's permission handling declines to cross that boundary for exactly this reason, and this is the same trap one API along.
+### 2. Obsidian's handler opens a web view, not a window
+
+Obsidian installs its own `setWindowOpenHandler` on each guest in the main process. That handler opens the address in another web view: a separate top-level browsing context with no opener, so the sign-in completes, the callback page lands with nothing to talk to, and the page that started the flow waits for a message that never arrives. The giveaway is visual. A sign-in popup with an Obsidian title bar is this.
+
+Replacing that handler is harder than it sounds, because `setWindowOpenHandler` returns its verdict to the main process **synchronously**, and `@electron/remote` invokes renderer callbacks asynchronously. Hand it a function from the renderer and the verdict arrives long after Electron has given up and denied the window. The plugin's permission handling declines to cross that boundary for exactly this reason; this is the same trap one API along.
 
 The way through is to never send a function across at all. Compile the handler in the main process instead:
 
 ```js
-const vm = require('@electron/remote').require('vm');
+const remote = require('@electron/remote');
 
-const install = vm.runInThisContext(`
-  (function (webContents) {
-    webContents.setWindowOpenHandler(function () {
-      return { action: "allow" };
-    });
+const install = remote.require('vm').runInThisContext(`
+  (function (guest, host, channel) {
+    guest.setWindowOpenHandler(function () { return { action: "allow" }; });
+    // ...plus the popup wiring described below
     return true;
   })
 `);
 
-install(remote.webContents.fromId(webview.getWebContentsId()));
+install(remote.webContents.fromId(webview.getWebContentsId()),
+        remote.getCurrentWebContents(),
+        'wvua-popup-trace');
 ```
 
-`install` is a main-process function. The only thing that crosses the boundary is the guest's `WebContents`, which is already a main-process object, so `@electron/remote` passes it back by reference rather than serialising it. The handler body closes over nothing in this realm and runs entirely in main, synchronously, the way Electron needs it to.
+`install` is a main-process function. Its arguments are two `WebContents` and a string: both objects are already main-process objects, so `@electron/remote` passes them back by reference rather than serialising them, and the handler body closes over nothing in the renderer. It runs entirely in main, synchronously, the way Electron needs it to.
 
 It has to run on `did-attach`, because the guest has no `WebContents` before that and Obsidian installs its handler as part of attaching. Ours goes in second and wins.
 
-The same main-process code reports each popup back to the renderer console: the URL it was asked for, whether it landed on the same Electron session as the guest, and every navigation, load and failure after that. A popup that opens and then sits there blank is the one failure shape that says nothing about its own cause, and none of that evidence is visible from the plugin's side of the boundary. The session check is the important one, because a popup on a different session is in a different browsing context group, so the opener can neither reach it nor navigate it.
+### 3. Obsidian will not let the window navigate
 
-### The popup still would not navigate
-
-With the handler replaced, the popup is a real window on the right session, opened at the right URL, and it renders nothing at all. The trace says why, by saying almost nothing:
+With the handler replaced, the popup is a real window, on the right session, opened at the right URL, and it renders nothing at all. The trace explains why by saying almost nothing:
 
 ```
-popup requested   {url: 'https://accounts.google.com/o/oauth2/v2/auth?...', disposition: 'new-window'}
-popup created     {url: 'https://accounts.google.com/o/oauth2/v2/auth?...', sameSession: true}
+popup requested     {url: 'https://accounts.google.com/o/oauth2/v2/auth?...'}
+popup created       {url: 'https://accounts.google.com/o/oauth2/v2/auth?...', sameSession: true}
 popup will-navigate {url: 'https://accounts.google.com/o/oauth2/v2/auth?...'}
 ```
 
-And then nothing. No load, no failure. A navigation that is announced and then neither completes nor fails was not stopped by the network. It was cancelled, and `event.preventDefault()` on `will-navigate` is what that looks like from outside.
+Then silence. No load, no failure. A navigation the network stops reports a failure; one that is announced and then goes quiet was cancelled, and `event.preventDefault()` on `will-navigate` is what that looks like from outside. Obsidian keeps its own windows from navigating away from the app, and it attaches those guards when a `WebContents` is created, which is before `did-create-window` fires.
 
-Obsidian keeps its own windows from navigating away from the app, and it attaches those guards when a `WebContents` is created, which is before `did-create-window` fires. Our popup is not an Obsidian window and has no business being held to that rule, so the plugin takes the guards off it:
+The popup is not an Obsidian window, so the guards come off it:
 
 ```js
 for (const event of ['will-navigate', 'will-frame-navigate', 'will-redirect']) {
@@ -139,19 +142,25 @@ for (const event of ['will-navigate', 'will-frame-navigate', 'will-redirect']) {
 }
 ```
 
-Only the popup is touched. The main window and the web views keep theirs. The count of guards found is reported before they come off, so the assumption is visible rather than buried, and the plugin's own listeners are attached afterwards so they do not strip themselves.
+Only the popup is touched. The main window and the web views keep theirs. The count found is reported before the strip, so if Obsidian stops guarding and the count comes back `0`, the assumption is visible instead of buried. The plugin's own listeners attach afterwards, or they would strip themselves.
 
-A second navigation matters as much as the first here. The auth URL carries `response_mode=form_post`, so Google's callback arrives as a form POST to the site that started the sign-in. That is a renderer-initiated navigation too, and it would hit the same guard.
+That guard is there to stop an *Obsidian* window being navigated away from the app, which would leave the app somewhere it cannot come back from. A popup showing a sign-in page has no app content to protect and is an ordinary browser window, so letting it navigate is what it is for. It inherits the web view's `webPreferences`, so it is no more privileged than the tab that opened it.
 
-There is a belt behind it. Two seconds after the window appears, if it has committed no URL and is not fetching anything, the plugin calls `loadURL()` on it, which does not emit `will-navigate` and so goes around any guard that survived. It backs off from a page that is merely slow.
+The second navigation matters as much as the first. The auth URL carries `response_mode=form_post`, so Google's callback arrives as a form POST back to the site that started the sign-in. That is renderer-initiated too, and it would hit the same guard.
 
-Nothing puts Obsidian's handler back, because `setWindowOpenHandler` has no getter. It does not need putting back: disabling the plugin rebuilds every web view, and the main process installs its handler again on each new guest.
-
-The cost is that *every* `window.open()` in a web view becomes a real window, including ordinary `target="_blank"` links that used to open an Obsidian tab. That is what the **Open popups as real windows** setting turns off.
+Behind that there is a belt. Two seconds in, a popup that has committed no address and is not fetching anything gets `loadURL()`, which emits no `will-navigate` and so goes around any guard that survived the strip. It holds off from three kinds of popup that are behaving: one opened deliberately empty for its opener to navigate, one that has already committed an address, and one that is merely slow.
 
 ### Popups and the user agent
 
-That introduces a second problem, which is why the session user agent matters here. A popup is a new `WebContents`, not the guest, so it does not inherit the element's `useragent` attribute. It takes the **session's** user agent instead, and on a partition Obsidian never initialised that is Obsidian's own UA, `obsidian/1.13.7 Electron/43.3.0` and all. Google blocks it. So the plugin also calls `session.setUserAgent()` on the clean partition through `@electron/remote`, which every later popup inherits. If `@electron/remote` cannot be loaded, that is now a console warning and a line in the settings tab rather than a silent `console.debug`, because on the popup path it is the difference between working and not.
+A popup is a new `WebContents`, not the guest, so it does not inherit the element's `useragent` attribute. It takes the **session's** user agent, and on a partition Obsidian never initialised that is Obsidian's own UA, `obsidian/1.13.7 Electron/43.3.0` and all. Google blocks it.
+
+So the plugin also calls `session.setUserAgent()` on the clean partition through `@electron/remote`, which every later popup inherits. If `@electron/remote` cannot be loaded, that is a console warning and a line in the settings tab rather than a silent `console.debug`, because on the popup path it is the difference between working and not.
+
+### What it costs
+
+*Every* `window.open()` in a web view becomes a real window, including ordinary `target="_blank"` links that used to open an Obsidian tab. That is the whole of what the **Open popups as real windows** setting turns off.
+
+Nothing puts Obsidian's window-open handler back, because `setWindowOpenHandler` has no getter. It does not need putting back: disabling the plugin rebuilds every web view, and the main process installs its handler again on each new guest.
 
 ## Why the partition is not called `vault-something`
 
@@ -212,10 +221,9 @@ There is no build step. `main.js` is plain CommonJS, committed as-is, so you can
 | --- | --- | --- |
 | **User agent** | empty | The UA string web views report. Empty means "take Obsidian's own UA and strip the `obsidian/` and `Electron/` tokens", which is exactly what Obsidian does for its own sessions and yields a normal Chrome UA. |
 | **Partition suffix** | `clean` | Appended to the partition name. Change it to start a brand new cookie jar, which is the fastest way to sign out of everything at once. |
-| **Allow popup windows** | on | Sets `allowpopups`, so Electron does not refuse `window.open()` outright. The cost is that any page in a web view can open a window unprompted, and ad blocking is off here. |
-| **Open popups as real windows** | on | Replaces Obsidian's `window.open()` handler, so popups become real windows with a live `window.opener` instead of another web view. Required for popup-mode sign-ins. Turning it off sends popups, and every link that opens a new window, back to an Obsidian tab. |
+| **Open popups as real windows** | on | Gives `window.open()` a real window with a live `window.opener`, instead of the web view Obsidian would open. Required for popup-mode sign-ins. Turning it off sends popups, and every link that opens a new window, back to an Obsidian tab. |
 | **Deny permission requests** | on | Denies camera, microphone, geolocation, notifications, MIDI, pointer lock, fullscreen and open-external requests from pages in web views. Leave it on. |
-| **Debug logging** | off | Traces every web view to the console: creation, navigation, load failures, and the page's own console output. Turn it on to find out where a sign-in falls over, then turn it off. |
+| **Debug logging** | off | Traces every web view to the console: creation, navigation, load failures, and the page's own console output. Popups are traced either way, but only their failures print unless this is on. |
 
 Settings apply to web views opened after you close the settings window. Existing ones keep what they were given.
 
@@ -239,15 +247,23 @@ Open the developer console with `Ctrl+Shift+I` (`Cmd+Opt+I` on macOS) and look f
   userAgent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...
 ```
 
-The settings tab shows the same two values, plus the user agent popup windows will report. If that third line says the session user agent is not set, `@electron/remote` is missing and popup sign-ins will fail even though signing into Google directly works.
+The settings tab reports the same two values and two more:
 
-Then try signing into Google in a Web Viewer tab.
+- **Popup window user agent.** If this says it is not set, `@electron/remote` is missing and popup sign-ins will fail even though signing into Google directly works.
+- **Popup windows.** Whether the handler compiled in the main process, and whether it has been applied to a web view yet. The main process returns a confirmation rather than the plugin assuming its call landed, so this distinguishes "installed" from "called without throwing".
 
-The settings tab's "Popup windows" line reports the takeover: whether the handler compiled in the main process, and whether it has actually been applied to a web view. The handler returns a confirmation from main rather than the plugin assuming the call landed, so that line distinguishes "installed" from "called without throwing".
+Then sign in somewhere. Direct Google sign-in should just work. For a popup sign-in the quickest check is visual: click the button and look at the window that appears. A bare window with no Obsidian chrome is the working case. An Obsidian title bar means Obsidian still owns `window.open()`, and the settings tab will say why.
 
-The quickest check on the popup path is visual. Click a "Continue with Google" button and look at the window that appears: an Obsidian title bar means Obsidian still owns `window.open()` and the takeover did not happen, and the settings tab's "Popup windows" line will say why. A bare window with no Obsidian chrome means the takeover worked.
+A popup that fails logs a warning whatever your settings, because a blank window says nothing on its own. For the rest, turn on **Debug logging** and click the button again:
 
-If it still fails from there, turn on **Debug logging** and watch the console while you click the button. A `webview element created` line at that moment is the same finding in text form: the popup became a web view rather than a window.
+```
+[webview-ua-override] popup requested {url: 'https://accounts.google.com/...'}
+[webview-ua-override] popup created {url: '...', sameSession: true, navigationGuards: 2}
+[webview-ua-override] popup guards-removed {count: 2}
+[webview-ua-override] popup loaded {url: 'https://accounts.google.com/...'}
+```
+
+`sameSession: false` means the popup landed on a different Electron session and the opener cannot reach it. `navigationGuards: 0` means Obsidian no longer guards window navigation and that part of the plugin is now doing nothing. A `popup stalled` warning means the navigation was blocked by something other than a listener, and the `loadURL()` fallback fired.
 
 If you ever see `create-browser-session passed through unrecognised args` in the console, Obsidian changed the IPC call shape and this plugin has stopped protecting the partition. That warning exists so the failure is visible instead of mysterious.
 
