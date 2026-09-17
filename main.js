@@ -19,7 +19,9 @@
  *   3. Every <webview> element gets an explicit Chrome user agent before it
  *      is attached to the DOM.
  *   4. Every <webview> element denies permission requests.
- *   5. Every <webview> element is allowed to open popup windows.
+ *   5. Every <webview> element is allowed to open popup windows, and Obsidian's
+ *      own handler for window.open() is displaced so those popups are real
+ *      windows rather than another web view.
  *
  * The partition name deliberately does not begin with "vault-". At startup,
  * before any window exists, Obsidian's main process sweeps the Partitions
@@ -53,6 +55,25 @@
  * opener, and it sits there blank while the page that started the flow times
  * out and reports a login error. Setting allowpopups gives the popup real
  * window semantics: same session, same cookie jar, live opener.
+ *
+ * That attribute alone is not enough, because Obsidian installs its own
+ * setWindowOpenHandler on each guest in the main process and a handler
+ * overrides the attribute outright. Obsidian's handler opens the URL in another
+ * web view, which is a separate top-level browsing context with no opener, so
+ * the popup arrives wearing Obsidian's own chrome and the handshake is just as
+ * dead as before. Ours has to replace it.
+ *
+ * A handler must return synchronously to the main process, so it cannot be a
+ * renderer function passed over @electron/remote: remote invokes renderer
+ * callbacks asynchronously and the return value never arrives in time. Instead
+ * the handler is compiled in the main process with vm.runInThisContext, and the
+ * only thing that crosses the boundary is the guest's WebContents, passed back
+ * as the remote object it already is. The handler body closes over nothing and
+ * runs entirely in main.
+ *
+ * Nothing can put Obsidian's handler back, because setWindowOpenHandler has no
+ * getter. It does not need putting back: unloading rebuilds every web view, and
+ * main installs its handler again on each new guest.
  *
  * A popup opened that way is a new WebContents, not the guest, so it does not
  * inherit the element's useragent attribute. It takes the session's user agent
@@ -91,11 +112,24 @@ const PERSIST_PREFIX = 'persist:';
 // directory leaves ours alone. See the note at the top of this file.
 const PARTITION_PREFIX = 'wvua-';
 
+// Compiled in the main process, never in this one. It takes the guest's
+// WebContents as its only argument so that nothing from this realm has to be
+// serialised across, and the handler it installs closes over nothing at all.
+const POPUP_HANDLER_SOURCE = [
+  '(function (webContents) {',
+  '  webContents.setWindowOpenHandler(function () {',
+  '    return { action: "allow" };',
+  '  });',
+  '  return true;',
+  '})',
+].join('\n');
+
 const DEFAULT_SETTINGS = {
   partitionSuffix: 'clean',
   userAgent: '',
   denyPermissions: true,
   allowPopups: true,
+  takeOverWindowOpen: true,
   debugLogging: false,
 };
 
@@ -136,6 +170,9 @@ class WebviewUAOverride extends Plugin {
     this.active = false;
     this.unloaded = false;
     this.sessionUserAgent = null;
+    this.remote = null;
+    this.installPopupHandler = null;
+    this.popupHandlerError = null;
   }
 
   async onload() {
@@ -170,6 +207,7 @@ class WebviewUAOverride extends Plugin {
     this.patchIpc();
     this.patchAllOpenWindows();
     this.applySessionUserAgent();
+    this.compilePopupHandler();
 
     // Popout windows are separate JS realms with their own Document.prototype.
     this.registerEvent(
@@ -371,6 +409,15 @@ class WebviewUAOverride extends Plugin {
     // opener link that popup-mode sign-ins depend on is never created.
     if (this.settings.allowPopups) el.setAttribute('allowpopups', '');
 
+    // The guest has no WebContents until it attaches, and Obsidian installs its
+    // own handler as part of attaching, so this has to wait and then replace it.
+    if (this.settings.takeOverWindowOpen && this.installPopupHandler) {
+      const plugin = this;
+      el.addEventListener('did-attach', function () {
+        plugin.replaceWindowOpenHandler(el);
+      }, { once: true });
+    }
+
     if (this.settings.debugLogging) this.instrumentWebview(el);
 
     if (this.settings.denyPermissions) {
@@ -378,6 +425,62 @@ class WebviewUAOverride extends Plugin {
         console.warn(LOG, 'denied permission request:', evt.permission, el.getAttribute('src') || '');
         try { evt.request.deny(); } catch (err) { console.error(LOG, err); }
       });
+    }
+  }
+
+  /* ---- patch 5b: take window.open() back from Obsidian ---- */
+
+  compilePopupHandler() {
+    this.installPopupHandler = null;
+    this.popupHandlerError = null;
+
+    if (!this.settings.takeOverWindowOpen) return;
+
+    const remote = this.loadRemote();
+    if (!remote) {
+      this.popupHandlerError = '@electron/remote is unavailable';
+      console.warn(
+        LOG,
+        'cannot take window.open() back from Obsidian:', this.popupHandlerError + '.',
+        'Popup sign-ins will keep opening in a web view with no opener and keep failing.'
+      );
+      return;
+    }
+
+    try {
+      const vm = remote.require('vm');
+      this.remote = remote;
+      this.installPopupHandler = vm.runInThisContext(POPUP_HANDLER_SOURCE, {
+        filename: 'webview-ua-override-popup-handler.js',
+      });
+      console.debug(LOG, 'popup handler compiled in the main process');
+    } catch (err) {
+      this.popupHandlerError = (err && err.message) || String(err);
+      console.warn(LOG, 'could not compile the popup handler:', this.popupHandlerError);
+    }
+  }
+
+  replaceWindowOpenHandler(el) {
+    if (!this.installPopupHandler || !this.remote) return;
+
+    let id;
+    try {
+      id = el.getWebContentsId();
+    } catch (err) {
+      console.warn(LOG, 'web view has no WebContents id at did-attach:', err && err.message);
+      return;
+    }
+
+    try {
+      const guest = this.remote.webContents.fromId(id);
+      if (!guest) {
+        console.warn(LOG, 'no WebContents for id', id);
+        return;
+      }
+      this.installPopupHandler(guest);
+      console.debug(LOG, 'window.open() handler replaced on WebContents', id);
+    } catch (err) {
+      console.warn(LOG, 'could not replace the window.open() handler:', err && err.message);
     }
   }
 
@@ -569,6 +672,27 @@ class WebviewUASettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Open popups as real windows')
+      .setDesc(
+        'Obsidian catches window.open() and opens the address in another web view, which has no link back to the ' +
+        'page that asked for it. A sign-in popup that lands there finishes and then has nothing to hand the result ' +
+        'to. This replaces that with a real popup window. Turning it off sends popups, and every link that opens a ' +
+        'new window, back to an Obsidian tab.'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.takeOverWindowOpen)
+          .onChange(async (value) => {
+            this.plugin.settings.takeOverWindowOpen = value;
+            await this.plugin.saveSettings();
+            // Compile or discard the main-process handler now, so the status
+            // below is right and the next web view picks the change up.
+            this.plugin.compilePopupHandler();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl)
       .setName('Deny permission requests')
       .setDesc(
         'Denies camera, microphone, geolocation, notifications, MIDI, pointer lock, fullscreen and open-external ' +
@@ -610,6 +734,17 @@ class WebviewUASettingTab extends PluginSettingTab {
           ? this.plugin.sessionUserAgent
           : 'not set, so popup windows report Obsidian\u2019s own user agent and Google will refuse them. ' +
             'See the console for why.'),
+    });
+    status.createEl('p', {
+      text:
+        'Popup windows: ' +
+        (!this.plugin.settings.takeOverWindowOpen
+          ? 'left to Obsidian, which opens them as web views. Popup sign-ins will not complete.'
+          : this.plugin.installPopupHandler
+            ? 'opened as real windows.'
+            : 'could not be taken over from Obsidian (' +
+              (this.plugin.popupHandlerError || 'unknown reason') +
+              '), so popup sign-ins will not complete.'),
     });
     status.createEl('p', {
       text:
