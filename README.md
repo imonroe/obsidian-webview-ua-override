@@ -119,6 +119,32 @@ It has to run on `did-attach`, because the guest has no `WebContents` before tha
 
 The same main-process code reports each popup back to the renderer console: the URL it was asked for, whether it landed on the same Electron session as the guest, and every navigation, load and failure after that. A popup that opens and then sits there blank is the one failure shape that says nothing about its own cause, and none of that evidence is visible from the plugin's side of the boundary. The session check is the important one, because a popup on a different session is in a different browsing context group, so the opener can neither reach it nor navigate it.
 
+### The popup still would not navigate
+
+With the handler replaced, the popup is a real window on the right session, opened at the right URL, and it renders nothing at all. The trace says why, by saying almost nothing:
+
+```
+popup requested   {url: 'https://accounts.google.com/o/oauth2/v2/auth?...', disposition: 'new-window'}
+popup created     {url: 'https://accounts.google.com/o/oauth2/v2/auth?...', sameSession: true}
+popup will-navigate {url: 'https://accounts.google.com/o/oauth2/v2/auth?...'}
+```
+
+And then nothing. No load, no failure. A navigation that is announced and then neither completes nor fails was not stopped by the network. It was cancelled, and `event.preventDefault()` on `will-navigate` is what that looks like from outside.
+
+Obsidian keeps its own windows from navigating away from the app, and it attaches those guards when a `WebContents` is created, which is before `did-create-window` fires. Our popup is not an Obsidian window and has no business being held to that rule, so the plugin takes the guards off it:
+
+```js
+for (const event of ['will-navigate', 'will-frame-navigate', 'will-redirect']) {
+  popup.removeAllListeners(event);
+}
+```
+
+Only the popup is touched. The main window and the web views keep theirs. The count of guards found is reported before they come off, so the assumption is visible rather than buried, and the plugin's own listeners are attached afterwards so they do not strip themselves.
+
+A second navigation matters as much as the first here. The auth URL carries `response_mode=form_post`, so Google's callback arrives as a form POST to the site that started the sign-in. That is a renderer-initiated navigation too, and it would hit the same guard.
+
+There is a belt behind it. Two seconds after the window appears, if it has committed no URL and is not fetching anything, the plugin calls `loadURL()` on it, which does not emit `will-navigate` and so goes around any guard that survived. It backs off from a page that is merely slow.
+
 Nothing puts Obsidian's handler back, because `setWindowOpenHandler` has no getter. It does not need putting back: disabling the plugin rebuilds every web view, and the main process installs its handler again on each new guest.
 
 The cost is that *every* `window.open()` in a web view becomes a real window, including ordinary `target="_blank"` links that used to open an Obsidian tab. That is what the **Open popups as real windows** setting turns off.
