@@ -173,6 +173,7 @@ class WebviewUAOverride extends Plugin {
     this.remote = null;
     this.installPopupHandler = null;
     this.popupHandlerError = null;
+    this.popupHandlerApplied = false;
   }
 
   async onload() {
@@ -433,6 +434,7 @@ class WebviewUAOverride extends Plugin {
   compilePopupHandler() {
     this.installPopupHandler = null;
     this.popupHandlerError = null;
+    this.popupHandlerApplied = false;
 
     if (!this.settings.takeOverWindowOpen) return;
 
@@ -477,7 +479,15 @@ class WebviewUAOverride extends Plugin {
         console.warn(LOG, 'no WebContents for id', id);
         return;
       }
-      this.installPopupHandler(guest);
+      // The handler returns true from the main process. Anything else means
+      // the call did not land where it was meant to, which is worth knowing
+      // before a sign-in fails for a reason nobody can see.
+      if (this.installPopupHandler(guest) !== true) {
+        this.popupHandlerError = 'the main process did not confirm the handler';
+        console.warn(LOG, this.popupHandlerError, 'for WebContents', id);
+        return;
+      }
+      this.popupHandlerApplied = true;
       console.debug(LOG, 'window.open() handler replaced on WebContents', id);
     } catch (err) {
       console.warn(LOG, 'could not replace the window.open() handler:', err && err.message);
@@ -740,11 +750,13 @@ class WebviewUASettingTab extends PluginSettingTab {
         'Popup windows: ' +
         (!this.plugin.settings.takeOverWindowOpen
           ? 'left to Obsidian, which opens them as web views. Popup sign-ins will not complete.'
-          : this.plugin.installPopupHandler
+          : this.plugin.popupHandlerApplied
             ? 'opened as real windows.'
-            : 'could not be taken over from Obsidian (' +
-              (this.plugin.popupHandlerError || 'unknown reason') +
-              '), so popup sign-ins will not complete.'),
+            : this.plugin.installPopupHandler
+              ? 'ready, and applied to each web view as it opens. Open one to confirm.'
+              : 'could not be taken over from Obsidian (' +
+                (this.plugin.popupHandlerError || 'unknown reason') +
+                '), so popup sign-ins will not complete.'),
     });
     status.createEl('p', {
       text:

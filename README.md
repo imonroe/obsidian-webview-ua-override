@@ -215,6 +215,8 @@ The settings tab shows the same two values, plus the user agent popup windows wi
 
 Then try signing into Google in a Web Viewer tab.
 
+The settings tab's "Popup windows" line reports the takeover: whether the handler compiled in the main process, and whether it has actually been applied to a web view. The handler returns a confirmation from main rather than the plugin assuming the call landed, so that line distinguishes "installed" from "called without throwing".
+
 The quickest check on the popup path is visual. Click a "Continue with Google" button and look at the window that appears: an Obsidian title bar means Obsidian still owns `window.open()` and the takeover did not happen, and the settings tab's "Popup windows" line will say why. A bare window with no Obsidian chrome means the takeover worked.
 
 If it still fails from there, turn on **Debug logging** and watch the console while you click the button. A `webview element created` line at that moment is the same finding in text form: the popup became a web view rather than a window.
